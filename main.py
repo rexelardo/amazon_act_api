@@ -1,129 +1,109 @@
-# app/main.py
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, AnyUrl
-from typing import Optional, Dict, Any
-import os
+from pydantic import BaseModel
+from typing import Optional
 from dotenv import load_dotenv
+from contextlib import redirect_stdout, redirect_stderr
+from io import StringIO
+import os
 
-# Nova Act
 from nova_act import NovaAct
-# If you want to catch auth errors specifically:
 try:
     from nova_act.types.errors import AuthError
 except Exception:
-    class AuthError(Exception):  # fallback if import path changes
-        pass
+    class AuthError(Exception): ...
 
-app = FastAPI(title="NovaAct Control API")
+app = FastAPI(title="NovaAct Minimal API")
+
+# --- Single, global NovaAct (keep one process/worker) ---
+NOVA: Optional[NovaAct] = None
+SESSION_ID: Optional[str] = None
+LOGS_DIR: Optional[str] = None
 
 class StartBody(BaseModel):
-    starting_page: Optional[AnyUrl] = "https://www.amazon.com"
+    starting_page: str = "https://www.amazon.com"
     headless: bool = True
-    # You can add more NovaAct kwargs here if needed, e.g. chrome_channel
 
-class NovaManager:
-    def __init__(self):
-        self.nova: Optional[NovaAct] = None
-        self.session_id: Optional[str] = None
-        self.logs_dir: Optional[str] = None
+class ActBody(BaseModel):
+    command: str
 
-    def start(self, starting_page: str, headless: bool) -> Dict[str, Any]:
-        if self.nova is not None:
-            # Already running; return status instead of duplicating sessions
-            return {
-                "running": True,
-                "session_id": self.session_id,
-                "logs_dir": self.logs_dir,
-                "note": "NovaAct already running",
-            }
-
-        # Initialize and start NovaAct
-        try:
-            self.nova = NovaAct(starting_page=starting_page, headless=headless)
-            # nova.start() typically prints and returns nothing; capture side-effects
-            self.nova.start()
-        except AuthError as e:
-            self.nova = None
-            raise HTTPException(status_code=401, detail=f"NovaAct auth failed: {str(e)}")
-        except Exception as e:
-            self.nova = None
-            raise HTTPException(status_code=500, detail=f"Failed to start NovaAct: {repr(e)}")
-
-        # Best-effort: pull session/log info if exposed
-        # NovaAct often logs these; not all attributes are public, so we keep this generic
-        self.session_id = getattr(self.nova, "session_id", None)
-        self.logs_dir = getattr(self.nova, "logs_dir", None)
-
-        return {
-            "running": True,
-            "session_id": self.session_id,
-            "logs_dir": self.logs_dir,
-            "starting_page": starting_page,
-            "headless": headless,
-        }
-
-    def status(self) -> Dict[str, Any]:
-        running = self.nova is not None
-        return {
-            "running": running,
-            "session_id": self.session_id,
-            "logs_dir": self.logs_dir,
-        }
-
-    def stop(self) -> Dict[str, Any]:
-        if self.nova is None:
-            return {"running": False, "note": "NovaAct not running"}
-
-        try:
-            # NovaAct may expose a close/stop; if not, deleting the instance is a fallback.
-            close_fn = getattr(self.nova, "stop", None) or getattr(self.nova, "close", None)
-            if callable(close_fn):
-                close_fn()
-        except Exception as e:
-            # We still clear our handle even if stop fails
-            self.nova = None
-            self.session_id = None
-            self.logs_dir = None
-            raise HTTPException(status_code=500, detail=f"Error stopping NovaAct: {repr(e)}")
-
-        self.nova = None
-        self.session_id = None
-        self.logs_dir = None
-        return {"running": False, "stopped": True}
-
-manager = NovaManager()
+def run_and_capture(fn, *args, **kwargs) -> str:
+    """Run a function and capture ONLY the console output produced during it."""
+    buf_out, buf_err = StringIO(), StringIO()
+    try:
+        with redirect_stdout(buf_out), redirect_stderr(buf_err):
+            return_val = fn(*args, **kwargs)
+    except Exception as e:
+        # include captured logs in the error so the client sees what happened
+        logs = buf_out.getvalue() + buf_err.getvalue()
+        raise HTTPException(status_code=500, detail={"error": repr(e), "logs": logs})
+    # Return both streams and (optionally) a repr of return value
+    return (buf_out.getvalue() + buf_err.getvalue()).rstrip()
 
 @app.on_event("startup")
 def on_startup():
     load_dotenv()
-    key = os.getenv("NOVA_ACT_API_KEY")
-    if not key:
-        # We don't crash: we allow the API to run so you can set the key later.
-        print("[WARN] NOVA_ACT_API_KEY not set; POST /nova/start will fail auth until it is set.")
-    # Optional: ensure Playwright browsers are installed in advance.
-    # You can preinstall via shell. See step 2.
+    if not os.getenv("NOVA_ACT_API_KEY"):
+        print("[WARN] NOVA_ACT_API_KEY not set; /nova/start will fail.")
 
 @app.get("/health")
 def health():
     return {"ok": True}
 
-@app.get("/env")
-def env():
-    key = os.getenv("NOVA_ACT_API_KEY")
-    masked = f"{key[:4]}…{key[-4:]}" if key and len(key) >= 8 else (key or None)
-    return {"NOVA_ACT_API_KEY_present": bool(key), "NOVA_ACT_API_KEY_masked": masked}
+@app.post("/nova/start")
+def nova_start(body: StartBody):
+    global NOVA, SESSION_ID, LOGS_DIR
+    if NOVA is not None:
+        return {
+            "ok": True,
+            "note": "already running",
+            "session_id": SESSION_ID,
+            "logs_dir": LOGS_DIR,
+        }
+    if not os.getenv("NOVA_ACT_API_KEY"):
+        raise HTTPException(status_code=401, detail="NOVA_ACT_API_KEY is not set")
+
+    def do_start():
+        # Instantiate & start NovaAct
+        global NOVA, SESSION_ID, LOGS_DIR
+        NOVA = NovaAct(starting_page=body.starting_page, headless=body.headless)
+        NOVA.start()
+        SESSION_ID = getattr(NOVA, "session_id", None)
+        LOGS_DIR = getattr(NOVA, "logs_dir", None)
+
+    try:
+        logs = run_and_capture(do_start)
+    except AuthError as e:
+        NOVA = None
+        raise HTTPException(status_code=401, detail=f"NovaAct auth failed: {e}")
+    return {
+        "ok": True,
+        "session_id": SESSION_ID,
+        "logs_dir": LOGS_DIR,
+        "logs": logs,  # <- this includes lines like the Playwright warning + "start session ... logs dir ..."
+    }
+
+@app.post("/nova/act")
+def nova_act(body: ActBody):
+    if NOVA is None:
+        raise HTTPException(status_code=400, detail="NovaAct not running; POST /nova/start first.")
+    # Capture exactly what nova.act printed for this command
+    logs = run_and_capture(NOVA.act, body.command)
+    return {"ok": True, "session_id": SESSION_ID, "logs_dir": LOGS_DIR, "logs": logs}
 
 @app.get("/nova/status")
 def nova_status():
-    return manager.status()
-
-@app.post("/nova/start")
-def nova_start(body: StartBody):
-    # Fail fast if key missing
-    if not os.getenv("NOVA_ACT_API_KEY"):
-        raise HTTPException(status_code=401, detail="NOVA_ACT_API_KEY is not set in environment/.env")
-    return manager.start(starting_page=str(body.starting_page), headless=body.headless)
+    return {"running": NOVA is not None, "session_id": SESSION_ID, "logs_dir": LOGS_DIR}
 
 @app.post("/nova/stop")
 def nova_stop():
-    return manager.stop()
+    global NOVA, SESSION_ID, LOGS_DIR
+    if NOVA is None:
+        return {"running": False, "note": "not running"}
+    try:
+        # capture shutdown logs too (if any)
+        _ = run_and_capture(getattr(NOVA, "stop", getattr(NOVA, "close", lambda: None)))
+    finally:
+        NOVA = None
+        SESSION_ID = None
+        LOGS_DIR = None
+    return {"running": False, "stopped": True}

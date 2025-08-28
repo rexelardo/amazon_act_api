@@ -5,6 +5,7 @@ load_dotenv()  # this reads .env and sets os.environ
 
 # confirm
 print(os.getenv("NOVA_ACT_API_KEY"))
-with NovaAct(starting_page="https://www.amazon.com") as nova:
-	nova.act("search for a coffee maker")
+nova = NovaAct(starting_page="https://www.amazon.com", headless=True)
+nova.start()
+nova.act("search for a coffee maker")
 	
