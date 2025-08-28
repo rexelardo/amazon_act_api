@@ -1,7 +1,9 @@
 from dotenv import load_dotenv
 from nova_act import NovaAct
 from fastapi import FastAPI
+from dotenv import load_dotenv
 
+load_dotenv()
 app = FastAPI()
 
 @app.get("/start")
